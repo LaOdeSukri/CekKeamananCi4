@@ -1,52 +1,58 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-sukri.py
-Audit non-destruktif untuk aplikasi CI4 / web lokal.
-Hasil: CSV dengan status keamanan tiap route.
-
-Fitur:
- - Auto crawl jika tidak ada urls.txt
- - Cek status HTTP & header keamanan
- - Analisis form (file upload, XSS refleksi, SQLi indikasi)
- - Output CSV: route, url, status, severity, issues, link
+ci4_audit_prod.py
+Production-ready CI4 site auditor (CSV output).
 """
 
+import argparse
 import requests
 from bs4 import BeautifulSoup
 import urllib.parse as urlparse
-import time, json, os, sys, argparse
-import pandas as pd
+import os, csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
 
-# ===== Default Config =====
+# Optional colorama for nicer console output (fallback to plain)
+try:
+    from colorama import init as colorama_init, Fore, Style
+    colorama_init(autoreset=True)
+    C_OK = Fore.GREEN
+    C_WARN = Fore.YELLOW
+    C_ERR = Fore.RED
+    C_INFO = Fore.CYAN
+    C_RST = Style.RESET_ALL
+except Exception:
+    C_OK = C_WARN = C_ERR = C_INFO = C_RST = ""
+
+# ---------- Defaults ----------
 DEFAULT_BASE = "http://localhost:8080"
 DEFAULT_INPUT = "urls.txt"
-DEFAULT_OUTPUT = "audit_output.csv"
-DEFAULT_TIMEOUT = 10
-MAX_WORKERS = 10
-MAX_CRAWL_PAGES = 50
+DEFAULT_OUTPUT = "report.csv"
+USER_AGENT = "CI4RoutesAudit/production-1.1"
+TIMEOUT = 8
+MAX_WORKERS = 8
+MAX_CRAWL_PAGES = 200
 MAX_CRAWL_DEPTH = 2
+# --------------------------------
 
-USER_AGENT = "CI4RoutesAudit/1.0"
+# Active payloads (only when --active)
+REFLECT_PAYLOAD = "<ci4_routes_reflect_TEST_123>"
+SQLI_PAYLOADS = [
+    "' OR '1'='1' --ci4test",
+    "\" OR \"1\"=\"1\" --ci4test",
+    "' OR 1=1 --ci4test",
+]
+SQL_ERROR_SIGNATURES = [
+    "sql syntax", "mysql", "syntax error", "sqlstate", "odbc", "sqlite", "ora-", "mysql_fetch", "pdoexception",
+    "internal server error", "warning: pg_", "you have an error in your sql syntax", "sql error"
+]
+COMMON_CSRF_NAMES = ["csrf", "csrf_token", "csrf_test_name", "_token", "token", "__requestverificationtoken"]
+
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
 
-REFLECT_PAYLOAD = "<ci4_routes_reflect_TEST_123>"
-SQLI_PAYLOAD = "' OR '1'='1' --test"
-
-SQL_ERROR_SIGNATURES = [
-    "sql syntax", "mysql", "syntax error", "sqlstate", "odbc", "sqlite",
-    "ora-", "mysql_fetch", "pdoexception", "you have an error in your sql syntax"
-]
-
-# ===== Colors =====
-C_OK = "\033[92m"
-C_WARN = "\033[93m"
-C_ERR = "\033[91m"
-C_INFO = "\033[94m"
-C_RST = "\033[0m"
-
-
+# ---------- Utilities ----------
 def full_url(base, path):
     if not path:
         return base
@@ -54,214 +60,172 @@ def full_url(base, path):
         return path
     return urlparse.urljoin(base.rstrip('/')+'/', path.lstrip('/'))
 
-
 def load_urls_from_file(fname):
     if not os.path.exists(fname):
         return []
     with open(fname, "r", encoding="utf-8") as f:
-        lines = [l.strip() for l in f.readlines()
-                 if l.strip() and not l.strip().startswith("#")]
-    return lines
+        return [l.strip() for l in f.readlines() if l.strip() and not l.strip().startswith("#")]
 
-
-def fetch(url, timeout=DEFAULT_TIMEOUT):
+def is_same_host(a, b):
     try:
-        r = session.get(url, timeout=timeout, allow_redirects=True)
-        return r
+        return urlparse.urlparse(a).netloc == urlparse.urlparse(b).netloc
     except Exception:
-        return None
+        return False
 
+# ---------- Crawler ----------
+def crawl_site(base_url, max_pages=MAX_CRAWL_PAGES, max_depth=MAX_CRAWL_DEPTH):
+    print(C_INFO + f"[i] Auto-crawl starting from {base_url} (max_pages={max_pages}, max_depth={max_depth})" + C_RST)
+    to_visit = deque([(base_url, 0)])
+    visited = set()
+    discovered = []
+    while to_visit and len(discovered) < max_pages:
+        url, depth = to_visit.popleft()
+        if url in visited or depth > max_depth:
+            continue
+        visited.add(url)
+        try:
+            r = session.get(url, timeout=TIMEOUT)
+            html = r.text or ""
+        except Exception:
+            continue
+        if is_same_host(base_url, url):
+            p = urlparse.urlparse(url).path or "/"
+            if p not in discovered:
+                discovered.append(p)
+        soup = BeautifulSoup(html, "lxml")
+        for a in soup.find_all("a", href=True):
+            link = urlparse.urljoin(url, a['href'])
+            if link.startswith(base_url) and link not in visited:
+                to_visit.append((link, depth + 1))
+    print(C_INFO + f"[i] Auto-crawl found {len(discovered)} routes" + C_RST)
+    return discovered
 
-def check_headers(r):
-    hdr = {k.lower(): v for k, v in r.headers.items()}
+# ---------- Checks ----------
+def check_security_headers(resp):
+    hdr = {k.lower(): v for k, v in resp.headers.items()}
     findings = {
-        "x-content-type-options": ('x-content-type-options' in hdr and 'nosniff' in hdr.get('x-content-type-options', '').lower()),
+        "x-content-type-options": ('x-content-type-options' in hdr and 'nosniff' in hdr.get('x-content-type-options','').lower()),
         "x-frame-options": ('x-frame-options' in hdr),
         "strict-transport-security": ('strict-transport-security' in hdr),
         "content-security-policy": ('content-security-policy' in hdr),
         "referrer-policy": ('referrer-policy' in hdr)
     }
-    return findings, hdr
+    missing = [k for k,v in findings.items() if not v]
+    return findings, missing, hdr
 
+def check_cookies(resp):
+    set_cookie_vals = resp.headers.get("Set-Cookie", "")
+    issues = []
+    if set_cookie_vals:
+        lower = set_cookie_vals.lower()
+        if 'httponly' not in lower:
+            issues.append("Cookie tanpa HttpOnly")
+        if resp.url.startswith("https") and 'secure' not in lower:
+            issues.append("Cookie tanpa Secure")
+        if 'samesite' not in lower:
+            issues.append("Cookie tanpa SameSite")
+    return issues, [set_cookie_vals] if set_cookie_vals else []
 
-def analyze_forms(page_url, html, timeout=DEFAULT_TIMEOUT, active=False):
+def extract_forms(page_url, html):
     soup = BeautifulSoup(html, "lxml")
-    forms = soup.find_all("form")
-    results = []
-    for form in forms:
-        form_info = {
-            "action": form.get("action") or "",
-            "method": (form.get("method") or "get").lower(),
-            "inputs": [],
-            "has_file": False,
-            "reflect_vuln": False,
-            "sqli_flag": False,
-            "notes": []
-        }
-        target = urlparse.urljoin(page_url, form_info["action"])
-        form_info["target_url"] = target
-        inputs = form.find_all(["input", "textarea", "select"])
-        input_names = []
-        for inp in inputs:
-            itype = (inp.get("type") or "").lower()
-            iname = inp.get("name") or inp.get("id") or ""
-            form_info["inputs"].append({"name": iname, "type": itype})
-            if itype == "file":
-                form_info["has_file"] = True
-            if iname:
-                input_names.append(iname)
+    forms = []
+    for form in soup.find_all("form"):
+        action = form.get("action") or ""
+        method = (form.get("method") or "get").lower()
+        enctype = (form.get("enctype") or "")
+        has_file, csrf = False, False
+        for inp in form.find_all(["input","textarea","select"]):
+            typ = (inp.get("type") or "").lower()
+            name = inp.get("name") or inp.get("id") or ""
+            if typ == "file" or ("multipart" in enctype.lower()):
+                has_file = True
+            if typ == "hidden" and name and any(k in name.lower() for k in COMMON_CSRF_NAMES):
+                csrf = True
+        forms.append({
+            "action": urlparse.urljoin(page_url, action),
+            "method": method,
+            "enctype": enctype,
+            "has_file": has_file,
+            "csrf_detected": csrf
+        })
+    return forms
 
-        if active:
-            test_ref = {n: REFLECT_PAYLOAD for n in input_names} if input_names else {"q": REFLECT_PAYLOAD}
-            test_sqli = {n: SQLI_PAYLOAD for n in input_names} if input_names else {"q": SQLI_PAYLOAD}
-            try:
-                if form_info["method"] == "post":
-                    r_ref = session.post(target, data=test_ref, timeout=timeout)
-                    r_sql = session.post(target, data=test_sqli, timeout=timeout)
-                else:
-                    r_ref = session.get(target, params=test_ref, timeout=timeout)
-                    r_sql = session.get(target, params=test_sqli, timeout=timeout)
-            except Exception as e:
-                form_info["notes"].append(f"Request failed: {e}")
-                results.append(form_info)
-                continue
-
-            body_ref = (r_ref.text or "").lower()
-            body_sql = (r_sql.text or "").lower()
-
-            if REFLECT_PAYLOAD.lower() in body_ref:
-                form_info["reflect_vuln"] = True
-                form_info["notes"].append("Reflected payload found in response")
-
-            for sig in SQL_ERROR_SIGNATURES:
-                if sig in body_sql:
-                    form_info["sqli_flag"] = True
-                    form_info["notes"].append("SQL error signature found in response")
-                    break
-
-        results.append(form_info)
-    return results
-
-
-def analyze_route(base, path, timeout=DEFAULT_TIMEOUT, active=False):
-    url = full_url(base, path)
-    entry = {"route": path, "url": url, "status": None,
-             "headers_ok": None, "headers": {}, "forms": [], "issues": [], "severity": "Aman"}
-    r = fetch(url, timeout=timeout)
-    if r is None:
-        entry["issues"].append("Gagal koneksi / timeout")
-        entry["severity"] = "Berbahaya"
+# ---------- Analysis ----------
+def analyze_route(base_url, path_or_url, active=False):
+    url = full_url(base_url, path_or_url)
+    entry = {"route": path_or_url, "url": url, "status": None, "issues": [], "has_forms": False,
+             "form_links": [], "redirects": []}
+    try:
+        r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+    except Exception as e:
+        entry.update(status="ERR", issues=[f"Gagal koneksi: {e}"], keterangan="Berbahaya")
         return entry
 
     entry["status"] = r.status_code
-    hdr_ok, hdrs = check_headers(r)
-    entry["headers_ok"] = all(hdr_ok.values())
-    entry["headers"] = hdrs
-    entry["forms"] = analyze_forms(url, r.text or "", timeout=timeout, active=active)
+    hdr_ok, missing_headers, hdrs = check_security_headers(r)
+    if missing_headers:
+        entry["issues"].append("Missing headers: " + ", ".join(missing_headers))
+    cookie_issues, _ = check_cookies(r)
+    entry["issues"].extend(cookie_issues)
 
-    if not entry["headers_ok"]:
-        entry["issues"].append("Missing security headers")
-
-    for f in entry["forms"]:
-        if f.get("reflect_vuln"):
-            entry["issues"].append(f"Reflected XSS -> {f.get('target_url')}")
-        if f.get("sqli_flag"):
-            entry["issues"].append(f"Possible SQL issue -> {f.get('target_url')}")
+    forms = extract_forms(url, r.text or "")
+    entry["has_forms"] = len(forms) > 0
+    for f in forms:
+        entry["form_links"].append(f.get("action") or "")
         if f.get("has_file"):
-            entry["issues"].append(f"File upload input -> {f.get('target_url')}")
+            entry["issues"].append(f"Form upload file -> {f.get('action')}")
+        if not f.get("csrf_detected"):
+            entry["issues"].append(f"Form mungkin tanpa CSRF token -> {f.get('action')}")
 
-    # Severity
-    if any("SQL" in i or "XSS" in i for i in entry["issues"]):
-        entry["severity"] = "Berbahaya"
-    elif entry["issues"]:
-        entry["severity"] = "Tidak Aman"
-    else:
-        entry["severity"] = "Aman"
-
+    # kategori
+    keterangan = "Aman"
+    if isinstance(entry["status"], int):
+        if entry["status"] >= 400:
+            keterangan = "Berbahaya"
+        elif missing_headers or cookie_issues:
+            keterangan = "Tidak Aman"
+    entry["keterangan"] = keterangan
     return entry
 
+# ---------- CSV ----------
+def write_csv(output_file, rows):
+    headers = ["Alamat", "Status", "Keterangan", "Issues", "Has_Forms", "Form_Links", "Redirects", "Link"]
+    with open(output_file, "w", newline="", encoding="utf-8-sig") as csvfile:
+        w = csv.writer(csvfile)
+        w.writerow(headers)
+        for r in rows:
+            issues_txt = " | ".join(r.get("issues") or [])
+            forms_txt = " | ".join(r.get("form_links") or [])
+            redirects_txt = " | ".join([f"{red['from']} -> {red['to']}" for red in r.get("redirects") or []])
+            w.writerow([
+                r.get("route"), r.get("status"), r.get("keterangan"),
+                issues_txt, "Ya" if r.get("has_forms") else "Tidak",
+                forms_txt, redirects_txt, r.get("url")
+            ])
 
-def crawl_site(base, max_pages=MAX_CRAWL_PAGES, max_depth=MAX_CRAWL_DEPTH):
-    visited, to_visit = set(), [(base, 0)]
-    results = []
-    while to_visit and len(results) < max_pages:
-        url, depth = to_visit.pop(0)
-        if url in visited or depth > max_depth:
-            continue
-        visited.add(url)
-        r = fetch(url)
-        if not r:
-            continue
-        results.append(url)
-        soup = BeautifulSoup(r.text, "lxml")
-        for a in soup.find_all("a", href=True):
-            nxt = full_url(base, a["href"])
-            if nxt.startswith(base):
-                to_visit.append((nxt, depth + 1))
-    return results
-
-
-def write_csv(fname, results):
-    rows = []
-    for r in results:
-        rows.append({
-            "route": r.get("route"),
-            "url": r.get("url"),
-            "status": r.get("status"),
-            "severity": r.get("severity"),
-            "issues": "; ".join(r.get("issues") or []),
-            "link": r.get("url")
-        })
-    df = pd.DataFrame(rows)
-    df.to_csv(fname, index=False, encoding="utf-8-sig")
-    print(C_INFO + f"[i] CSV saved -> {fname}" + C_RST)
-
-
+# ---------- Runner ----------
 def main():
-    ap = argparse.ArgumentParser(description="CI4 Routes Auditor -> CSV (dev/stage only).")
-    ap.add_argument("--base", "-b", default=DEFAULT_BASE, help="BASE URL (contoh: http://localhost:8080)")
-    ap.add_argument("--input", "-i", default=DEFAULT_INPUT, help="Input file (urls.txt). Jika tidak ada: auto-crawl")
-    ap.add_argument("--output", "-o", default=DEFAULT_OUTPUT, help="Output CSV file path")
-    ap.add_argument("--workers", "-w", type=int, default=MAX_WORKERS, help="Parallel workers")
-    ap.add_argument("--timeout", "-t", type=int, default=DEFAULT_TIMEOUT, help="Request timeout (detik)")
-    ap.add_argument("--active", action="store_true", help="Enable active tests (reflected XSS / SQLi) — dev/stage only")
-    ap.add_argument("--max-pages", type=int, default=MAX_CRAWL_PAGES, help="Max pages to crawl (if no input file)")
-    ap.add_argument("--max-depth", type=int, default=MAX_CRAWL_DEPTH, help="Max crawl depth")
-    ap.add_argument("--no-ssl-verify", action="store_true", help="Disable SSL verify (useful untuk dev self-signed)")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="CI4 Auditor (Production Ready)")
+    parser.add_argument("--base", default=DEFAULT_BASE, help="Base URL (default: localhost:8080)")
+    parser.add_argument("--input", default=DEFAULT_INPUT, help="File daftar URL (default: urls.txt)")
+    parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output CSV file (default: report.csv)")
+    args = parser.parse_args()
 
-    session.verify = not args.no_ssl_verify
     urls = load_urls_from_file(args.input)
-
-    if urls:
-        print(C_INFO + f"[i] Loaded {len(urls)} entries from {args.input}" + C_RST)
-    else:
-        print(C_INFO + "[i] No input file found, auto crawling..." + C_RST)
-        urls = crawl_site(args.base, max_pages=args.max_pages, max_depth=args.max_depth)
-
     if not urls:
-        print(C_ERR + "[!] Tidak ada URL untuk diuji." + C_RST)
-        sys.exit(1)
-
-    print(C_INFO + f"[i] Mulai uji {len(urls)} halaman dengan {args.workers} workers..." + C_RST)
+        urls = crawl_site(args.base)
 
     results = []
-    with ThreadPoolExecutor(max_workers=args.workers) as exe:
-        futures = {exe.submit(analyze_route, args.base, u, args.timeout, args.active): u for u in urls}
-        for fut in as_completed(futures):
-            res = fut.result()
-            results.append(res)
-            status = res.get("status") or "ERR"
-            severity = res.get("severity") or "?"
-            if severity == "Aman":
-                print(C_OK + f"[OK] {res.get('route')} -> {status}" + C_RST)
-            elif severity == "Tidak Aman":
-                print(C_WARN + f"[!] {res.get('route')} -> {status}" + C_RST)
-            else:
-                print(C_ERR + f"[X] {res.get('route')} -> {status}" + C_RST)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(analyze_route, args.base, u): u for u in urls}
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                print(C_ERR + f"[!] Error menganalisis {futures[future]}: {e}" + C_RST)
 
     write_csv(args.output, results)
-
+    print(C_OK + f"[✓] Audit selesai, hasil tersimpan di {args.output}" + C_RST)
 
 if __name__ == "__main__":
     main()
